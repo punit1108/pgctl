@@ -43,13 +43,18 @@ jobs:
         id: previoustag
         run: |
           # Get the previous tag (before current one)
-          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "${{ steps.tag.outputs.tag }}" | head -n 1)
+          CURRENT_TAG="${{ steps.tag.outputs.tag }}"
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "^${CURRENT_TAG}$" | head -n 1)
+          
           if [ -z "$PREVIOUS_TAG" ]; then
-            # If no previous tag, use the first commit
-            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+            echo "⚠️  No previous tag found - this is the first release"
+            echo "tag=" >> $GITHUB_OUTPUT
+            echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "📌 Previous tag: $PREVIOUS_TAG"
+            echo "tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+            echo "exists=true" >> $GITHUB_OUTPUT
           fi
-          echo "tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
-          echo "📌 Previous tag/commit: $PREVIOUS_TAG"
 
       - name: Build Structured Changelog
         id: structured_changelog
@@ -107,7 +112,7 @@ jobs:
                 }
               ]
             }
-          fromTag: ${{ steps.previoustag.outputs.tag }}
+          fromTag: ${{ steps.previoustag.outputs.exists == 'true' && steps.previoustag.outputs.tag || '' }}
           toTag: ${{ steps.tag.outputs.tag }}
           failOnError: false
         env:
@@ -137,30 +142,68 @@ jobs:
               return;
             }
             
-            // Get commit details between tags
-            const { data: commits } = await github.rest.repos.compareCommits({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              base: prevTag,
-              head: tag
-            });
-            
-            // Extract commit messages and files changed
-            const commitSummary = commits.commits.map(c => ({
-              message: c.commit.message,
-              author: c.commit.author.name,
-              files: c.files?.length || 0
-            }));
-            
-            const filesChanged = commits.files?.map(f => f.filename) || [];
-            const stats = {
-              commits: commits.commits.length,
-              files: filesChanged.length,
-              additions: commits.commits.reduce((sum, c) => sum + (c.stats?.additions || 0), 0),
-              deletions: commits.commits.reduce((sum, c) => sum + (c.stats?.deletions || 0), 0)
+            // Get commit details between tags with error handling
+            let commits = null;
+            let commitSummary = [];
+            let filesChanged = [];
+            let stats = {
+              commits: 0,
+              files: 0,
+              additions: 0,
+              deletions: 0
             };
             
-            console.log('📊 Changes:', JSON.stringify(stats, null, 2));
+            try {
+              console.log(`🔍 Comparing ${prevTag}...${tag}`);
+              const compareResult = await github.rest.repos.compareCommits({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                base: prevTag,
+                head: tag
+              });
+              commits = compareResult.data;
+              
+              // Extract commit messages and files changed
+              commitSummary = commits.commits.map(c => ({
+                message: c.commit.message,
+                author: c.commit.author.name,
+                files: c.files?.length || 0
+              }));
+              
+              filesChanged = commits.files?.map(f => f.filename) || [];
+              stats = {
+                commits: commits.commits.length,
+                files: filesChanged.length,
+                additions: commits.commits.reduce((sum, c) => sum + (c.stats?.additions || 0), 0),
+                deletions: commits.commits.reduce((sum, c) => sum + (c.stats?.deletions || 0), 0)
+              };
+              
+              console.log('📊 Changes:', JSON.stringify(stats, null, 2));
+            } catch (error) {
+              console.log('⚠️  Could not fetch commit comparison:', error.message);
+              console.log('📝 Will use structured changelog only for AI enhancement');
+              
+              // Fallback: try to get recent commits for the current tag
+              try {
+                const tagCommits = await github.rest.repos.listCommits({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  sha: tag,
+                  per_page: 20
+                });
+                
+                commitSummary = tagCommits.data.slice(0, 10).map(c => ({
+                  message: c.commit.message,
+                  author: c.commit.author.name,
+                  files: 0
+                }));
+                
+                stats.commits = tagCommits.data.length;
+                console.log(`📝 Using ${stats.commits} recent commits as context`);
+              } catch (fallbackError) {
+                console.log('⚠️  Could not fetch recent commits either:', fallbackError.message);
+              }
+            }
             
             try {
               const systemPrompt = [
@@ -178,29 +221,48 @@ jobs:
                 '- Start with a brief 2-3 sentence overview',
                 '- Organize changes by category with clear headings',
                 '- Use bullet points for clarity',
-                '- Mention statistics (commits, files, lines) if significant',
+                '- Mention statistics (commits, files, lines) if provided',
                 '- Keep it concise but informative'
               ].join('\n');
               
-              const userPrompt = [
-                `Create release notes for ${tag} (previous: ${prevTag})`,
-                '',
-                '**Statistics:**',
-                `- ${stats.commits} commits`,
-                `- ${stats.files} files changed`,
-                `- +${stats.additions} / -${stats.deletions} lines`,
-                '',
-                '**Structured Changelog:**',
-                structuredChangelog,
-                '',
-                '**Recent Commits:**',
-                commitSummary.slice(0, 10).map(c => `- ${c.message.split('\n')[0]}`).join('\n'),
-                '',
-                '**Key Files Modified:**',
-                filesChanged.slice(0, 15).join(', '),
-                '',
-                'Create comprehensive release notes with an overview, categorized changes, and highlight the most important improvements for users.'
-              ].join('\n');
+              const userPromptParts = [
+                `Create release notes for ${tag}${prevTag ? ` (previous: ${prevTag})` : ''}`,
+                ''
+              ];
+              
+              // Add statistics if available
+              if (stats.commits > 0) {
+                userPromptParts.push('**Statistics:**');
+                userPromptParts.push(`- ${stats.commits} commits`);
+                if (stats.files > 0) {
+                  userPromptParts.push(`- ${stats.files} files changed`);
+                  userPromptParts.push(`- +${stats.additions} / -${stats.deletions} lines`);
+                }
+                userPromptParts.push('');
+              }
+              
+              // Add structured changelog
+              userPromptParts.push('**Structured Changelog:**');
+              userPromptParts.push(structuredChangelog || 'No structured changes available');
+              userPromptParts.push('');
+              
+              // Add commit summaries if available
+              if (commitSummary.length > 0) {
+                userPromptParts.push('**Recent Commits:**');
+                userPromptParts.push(commitSummary.slice(0, 10).map(c => `- ${c.message.split('\n')[0]}`).join('\n'));
+                userPromptParts.push('');
+              }
+              
+              // Add files changed if available
+              if (filesChanged.length > 0) {
+                userPromptParts.push('**Key Files Modified:**');
+                userPromptParts.push(filesChanged.slice(0, 15).join(', '));
+                userPromptParts.push('');
+              }
+              
+              userPromptParts.push('Create comprehensive release notes with an overview, categorized changes, and highlight the most important improvements for users.');
+              
+              const userPrompt = userPromptParts.join('\n');
               
               const response = await fetch('https://api.openai.com/v1/chat/completions', {
                 method: 'POST',
@@ -253,6 +315,7 @@ jobs:
           STRUCTURED: ${{ steps.structured_changelog.outputs.changelog }}
           TAG: ${{ steps.tag.outputs.tag }}
           PREV_TAG: ${{ steps.previoustag.outputs.tag }}
+          PREV_TAG_EXISTS: ${{ steps.previoustag.outputs.exists }}
           REPO: ${{ github.repository }}
         with:
           script: |
@@ -260,6 +323,7 @@ jobs:
             const structured = process.env.STRUCTURED;
             const tag = process.env.TAG;
             const prevTag = process.env.PREV_TAG;
+            const prevTagExists = process.env.PREV_TAG_EXISTS === 'true';
             const repo = process.env.REPO;
             
             let body = '';
@@ -267,13 +331,20 @@ jobs:
             if (aiEnhanced && aiEnhanced.trim()) {
               console.log('✅ Using AI-enhanced changelog');
               body = aiEnhanced;
-            } else {
+            } else if (structured && structured.trim()) {
               console.log('📝 Using structured changelog (AI unavailable)');
               body = `## 📝 What's Changed\n\n${structured}`;
+            } else {
+              console.log('ℹ️  No changelog available - using default message');
+              body = `## 📝 Release ${tag}\n\nThis is the initial release of pgctl.`;
             }
             
-            // Add comparison link
-            body += `\n\n**Full Changelog**: https://github.com/${repo}/compare/${prevTag}...${tag}`;
+            // Add comparison link if previous tag exists
+            if (prevTagExists && prevTag) {
+              body += `\n\n**Full Changelog**: https://github.com/${repo}/compare/${prevTag}...${tag}`;
+            } else {
+              body += `\n\n**Release**: https://github.com/${repo}/releases/tag/${tag}`;
+            }
             
             // Add installation section
             body += `\n\n## 🚀 Installation\n\n`;
