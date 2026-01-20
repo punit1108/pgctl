@@ -1,0 +1,189 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for release (e.g., v1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: read
+  issues: read
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Changelog
+        id: changelog
+        uses: mikepenz/release-changelog-builder-action@v4
+        with:
+          configuration: |
+            {
+              "template": "## 📝 What's Changed\n\n#{{CHANGELOG}}\n\n**Full Changelog**: #{{RELEASE_DIFF}}",
+              "categories": [
+                {
+                  "title": "## 🎉 Features",
+                  "labels": ["feature", "feat", "feature request", "enhancement"]
+                },
+                {
+                  "title": "## 🐛 Bug Fixes",
+                  "labels": ["bug", "fix", "bugfix"]
+                },
+                {
+                  "title": "## 📚 Documentation",
+                  "labels": ["documentation", "docs"]
+                },
+                {
+                  "title": "## 🔧 Maintenance",
+                  "labels": ["chore", "dependencies"]
+                },
+                {
+                  "title": "## 🚀 Performance",
+                  "labels": ["performance"]
+                },
+                {
+                  "title": "## 🔒 Security",
+                  "labels": ["security"]
+                }
+              ],
+              "label_extractor": [
+                {
+                  "pattern": "^(feat|feature)(\\(.+\\))?:",
+                  "target": "feature"
+                },
+                {
+                  "pattern": "^fix(\\(.+\\))?:",
+                  "target": "bug"
+                },
+                {
+                  "pattern": "^docs?(\\(.+\\))?:",
+                  "target": "documentation"
+                },
+                {
+                  "pattern": "^chore(\\(.+\\))?:",
+                  "target": "chore"
+                },
+                {
+                  "pattern": "^perf(\\(.+\\))?:",
+                  "target": "performance"
+                }
+              ]
+            }
+          toTag: ${{ steps.tag.outputs.tag }}
+          failOnError: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enhance with AI (Optional)
+        id: ai_enhance
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          script: |
+            const changelog = process.env.CHANGELOG;
+            const apiKey = process.env.OPENAI_API_KEY;
+            const tag = process.env.TAG;
+            
+            if (!apiKey || !changelog) {
+              console.log('Skipping AI enhancement');
+              core.setOutput('enhanced', '');
+              return;
+            }
+            
+            try {
+              const response = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify({
+                  model: 'gpt-4-turbo-preview',
+                  messages: [
+                    {
+                      role: 'system',
+                      content: 'You are a technical writer creating release notes for a PostgreSQL CLI management tool. Make the notes professional and user-friendly while keeping all technical details.'
+                    },
+                    {
+                      role: 'user',
+                      content: `Create polished release notes for ${tag} based on:\n\n${changelog}\n\nAdd a brief overview at the top and installation instructions at the bottom.`
+                    }
+                  ],
+                  temperature: 0.7,
+                  max_tokens: 2000
+                })
+              });
+              
+              const data = await response.json();
+              const content = data.choices?.[0]?.message?.content || '';
+              core.setOutput('enhanced', content);
+            } catch (error) {
+              console.error('AI enhancement failed:', error);
+              core.setOutput('enhanced', '');
+            }
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
+          body: |
+            ${{ steps.ai_enhance.outputs.enhanced || steps.changelog.outputs.changelog }}
+            
+            ## 🚀 Installation
+            
+            ```bash
+            git clone https://github.com/${{ github.repository }}.git
+            cd postgres
+            ./install.sh
+            ```
+            
+            ## 📖 Documentation
+            
+            - [README](https://github.com/${{ github.repository }}/blob/main/README.md)
+            - [Installation Guide](https://github.com/${{ github.repository }}/blob/main/docs/INSTALLATION.md)
+            - [Contributing](https://github.com/${{ github.repository }}/blob/main/docs/CONTRIBUTING.md)
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update latest tag
+        uses: EndBug/latest-tag@latest
+        with:
+          ref: latest
+          description: Latest stable release
+          force-branch: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

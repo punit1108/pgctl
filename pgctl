@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# =============================================================================
+# pgctl - PostgreSQL Management Tool
+# =============================================================================
+# A CLI tool for managing PostgreSQL databases, schemas, and users
+# Built with Charm Bracelet's gum for interactive, glamorous shell scripts
+# =============================================================================
+
+set -e
+
+# Get pgctl root directory (resolve symlinks)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+# Follow symlinks to get the real path
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ $SCRIPT_PATH != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+PGCTL_ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+export PGCTL_ROOT
+
+# Source all library files
+source "${PGCTL_ROOT}/lib/common.sh"
+source "${PGCTL_ROOT}/lib/permissions.sh"
+source "${PGCTL_ROOT}/lib/database.sh"
+source "${PGCTL_ROOT}/lib/schema.sh"
+source "${PGCTL_ROOT}/lib/users.sh"
+source "${PGCTL_ROOT}/lib/menu.sh"
+
+# =============================================================================
+# CLI Argument Parsing
+# =============================================================================
+
+# Parse connection options
+parse_connection_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host|-h)
+                export PGHOST="$2"
+                shift 2
+                ;;
+            --port|-p)
+                export PGPORT="$2"
+                shift 2
+                ;;
+            --user|-u)
+                export PGADMIN="$2"
+                shift 2
+                ;;
+            --password|-P)
+                export PGPASSWORD="$2"
+                shift 2
+                ;;
+
+            --sslmode|-s)
+                export PGSSLMODE="$2"
+                shift 2
+                ;;
+            --sslrootcert|-r)
+                export PGSSLROOTCERT="$2"
+                shift 2
+                ;;
+            --database|-d)
+                export PGDATABASE="$2"
+                shift 2
+                ;;
+            *)
+                # Return remaining args
+                echo "$@"
+                return
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
+# Test Runner Function
+# =============================================================================
+
+cmd_run_tests() {
+    local test_runner="${PGCTL_ROOT}/tests/test-runner.sh"
+    
+    if [[ ! -f "$test_runner" ]]; then
+        log_error "Test runner not found: $test_runner"
+        return 1
+    fi
+    
+    # Pass all remaining arguments to the test runner
+    bash "$test_runner" "$@"
+}
+
+# =============================================================================
+# Main Command Router
+# =============================================================================
+
+main() {
+    local command="${1:-}"
+    shift 2>/dev/null || true
+    
+    # Parse any connection args from remaining arguments
+    local remaining_args
+    remaining_args=$(parse_connection_args "$@")
+    
+    # If PGPASSWORD is not set, prompt for it on commands that need it
+    case "$command" in
+        create-db|delete-db|create-schema|delete-schema|create-user|change-password|delete-user|grant-existing|add-schema-users|test)
+            if [[ -z "${PGPASSWORD:-}" ]]; then
+                PGPASSWORD=$(prompt_password "PostgreSQL admin password")
+                export PGPASSWORD
+            fi
+            ;;
+    esac
+    
+    case "$command" in
+        # No command - show interactive menu
+        "")
+            display_menu
+            ;;
+        
+        # DATABASE COMMANDS
+        create-db)
+            cmd_create_db $remaining_args
+            ;;
+        delete-db)
+            cmd_delete_db $remaining_args
+            ;;
+        list-databases)
+            cmd_list_databases $remaining_args
+            ;;
+        
+        # SCHEMA COMMANDS
+        create-schema)
+            cmd_create_schema $remaining_args
+            ;;
+        delete-schema)
+            cmd_delete_schema $remaining_args
+            ;;
+        list-schemas)
+            cmd_list_schemas $remaining_args
+            ;;
+        list-schema-users)
+            cmd_list_schema_users $remaining_args
+            ;;
+        grant-schema-access)
+            cmd_grant_schema_access $remaining_args
+            ;;
+        add-schema-users)
+            cmd_add_schema_users $remaining_args
+            ;;
+        
+        # USER COMMANDS
+        create-user)
+            cmd_create_user $remaining_args
+            ;;
+        change-password)
+            cmd_change_password $remaining_args
+            ;;
+        delete-user)
+            cmd_delete_user $remaining_args
+            ;;
+        list-users)
+            cmd_list_users $remaining_args
+            ;;
+        view-user)
+            cmd_view_user $remaining_args
+            ;;
+        
+        # PERMISSION COMMANDS
+        grant-existing)
+            cmd_grant_existing $remaining_args
+            ;;
+        audit)
+            cmd_audit $remaining_args
+            ;;
+        
+        # TESTING & UTILITIES
+        test)
+            cmd_run_tests $remaining_args
+            ;;
+        interactive)
+            display_menu
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        version|--version|-v)
+            show_version
+            ;;
+        
+        # Unknown command
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            echo "Run 'pgctl help' for usage information."
+            exit 1
+            ;;
+    esac
+}
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+main "$@"

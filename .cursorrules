@@ -1,0 +1,123 @@
+# PostgreSQL Management Tool (pgctl) - Cursor Rules
+
+## Critical Safety Rules for Database Testing
+
+### STRICT LOCAL-ONLY DATABASE TESTING POLICY
+
+**NEVER run tests against anything but a local database.**
+
+#### Enforcement Rules:
+
+1. **Host Validation - MANDATORY**
+   - Tests MUST only run against `localhost`, `127.0.0.1`, or `::1`
+   - REJECT any test execution where `PGHOST` is set to a remote host
+   - REJECT any test configuration pointing to non-local IP addresses
+   - CHECK configuration files (`config.env`) before running tests
+
+2. **Pre-Test Validation Required**
+   - Before executing `test.sh`, `test-runner.sh`, or any test file:
+     - VERIFY that `PGHOST` is set to a local address
+     - VERIFY that `TEST_HOST` is set to a local address
+     - WARN if any database connection string contains non-local hosts
+     - ABORT test execution if remote host detected
+
+3. **Prohibited Actions**
+   - NEVER modify test scripts to accept remote database connections
+   - NEVER bypass host validation checks
+   - NEVER run tests with `--host` flag pointing to remote servers
+   - NEVER commit configuration files with production/staging credentials
+   - NEVER suggest running tests against non-local databases
+
+4. **Required Validation Pattern**
+   ```bash
+   # Before running ANY test, validate:
+   if [[ "$PGHOST" != "localhost" ]] && \
+      [[ "$PGHOST" != "127.0.0.1" ]] && \
+      [[ "$PGHOST" != "::1" ]] && \
+      [[ "$TEST_HOST" != "localhost" ]] && \
+      [[ "$TEST_HOST" != "127.0.0.1" ]] && \
+      [[ "$TEST_HOST" != "::1" ]]; then
+       echo "ERROR: Tests can only run against local database"
+       echo "Current PGHOST: $PGHOST"
+       echo "Current TEST_HOST: $TEST_HOST"
+       exit 1
+   fi
+   ```
+
+5. **Local Database Indicators**
+   - Valid local addresses: `localhost`, `127.0.0.1`, `::1`, `local`
+   - Default port `5432` is acceptable for local testing
+   - Test database name should contain "test" or be explicitly `pgctl_test`
+
+6. **Warning Signs of Non-Local Testing**
+   - IP addresses other than 127.0.0.1/::1
+   - Domain names or hostnames (e.g., `db.example.com`, `postgres.internal`)
+   - Cloud database URLs (e.g., AWS RDS, Azure, GCP endpoints)
+   - Environment variables pointing to production/staging
+   - Connection strings with `sslmode=require` (often indicates remote DB)
+
+7. **Code Review Checklist**
+   - When modifying test files, verify no remote host logic is added
+   - When adding new test features, ensure local-only constraint maintained
+   - When debugging test failures, never suggest running against remote DB
+   - When writing documentation, emphasize local-only testing policy
+
+8. **Emergency Override Protocol**
+   - If a user explicitly requests to test against a remote database:
+     - WARN about the dangers (data loss, performance impact, security)
+     - REQUIRE explicit confirmation that it's a dedicated test environment
+     - SUGGEST creating a local Docker container instead
+     - DOCUMENT the risks clearly in any code comments
+
+#### Rationale:
+
+Tests perform destructive operations including:
+- Creating and dropping databases
+- Creating and dropping users
+- Modifying permissions
+- Running cleanup routines
+
+Running these against production or staging databases would cause:
+- Data loss
+- Service disruption
+- Security vulnerabilities
+- Compliance violations
+
+#### Exceptions:
+
+There are NO exceptions to this rule. All testing must be local.
+
+For integration testing against remote environments, create separate non-destructive test suites that:
+- Do not create/drop databases
+- Do not create/drop users
+- Only perform read operations or use dedicated test schemas
+- Are clearly marked as "integration" not "unit" tests
+
+---
+
+## Additional Development Guidelines
+
+### Test Development
+- Always use the test database `pgctl_test` by default
+- Set test passwords via environment variables, never hardcoded
+- Clean up test resources in all test paths (success and failure)
+- Use meaningful test names describing what is being tested
+
+### Configuration Management
+- Never commit `config.env` with real credentials
+- Always provide `config.env.example` as template
+- Document all configuration options
+- Use environment variables for sensitive data
+
+### Code Quality
+- Follow existing code style (bash best practices)
+- Add comments for complex logic
+- Validate inputs before database operations
+- Handle errors gracefully with informative messages
+- Use the `log_*` functions for consistent output formatting
+
+### Documentation
+- Keep README.md up to date with new features
+- Document breaking changes in commit messages
+- Provide examples for common use cases
+- Include troubleshooting tips for common issues

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://github.com/ppunit/gw-scripts/postgres/blob/main/README.md
+    about: Please review the documentation before creating an issue
+  - name: 💬 Discussions
+    url: https://github.com/ppunit/gw-scripts/postgres/discussions
+    about: Use GitHub Discussions for questions and general discussions
