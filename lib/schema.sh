@@ -436,16 +436,32 @@ _delete_one_schema() {
     done
 }
 
-# Delete a schema and its users (supports multiselect schemas)
+# Delete a schema and its users (supports multiselect schemas and preselected list)
 delete_schema() {
-    local dbname="${1:-}"
-    local schemaname="${2:-}"
-    
     log_header "Delete Schema"
     
     # Check connection
     if ! check_connection; then
         return 1
+    fi
+    
+    local dbname=""
+    local selected_schemas=""
+    
+    # Determine mode based on arguments:
+    # $# == 0: interactive (select db, then multiselect schemas)
+    # $# == 1: just db provided, multiselect schemas
+    # $# == 2: db and one schema
+    # $# >= 3: db and multiple schemas (preselected list)
+    
+    if [[ $# -ge 1 && -n "$1" ]]; then
+        dbname="$1"
+        shift
+        
+        if [[ $# -ge 1 && -n "$1" ]]; then
+            # Preselected schema(s) provided
+            selected_schemas=$(printf '%s\n' "$@")
+        fi
     fi
     
     # Get database name if not provided
@@ -458,16 +474,15 @@ delete_schema() {
             return 1
         fi
         
-        dbname=$(prompt_select "Select database:" $databases)
+        dbname=$(prompt_select "Select database:" $databases "Back")
         
-        if [[ -z "$dbname" ]]; then
-            log_error "No database selected"
-            return 1
+        if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+            return 0
         fi
     fi
     
-    # Get schema name(s) if not provided
-    if [[ -z "$schemaname" ]]; then
+    # Get schema name(s) if not provided via args
+    if [[ -z "$selected_schemas" ]]; then
         local schemas
         schemas=$(list_with_loading "schemas" "list_schemas_query '$dbname'")
         
@@ -476,78 +491,35 @@ delete_schema() {
             return 1
         fi
         
-        # Use multiselect for interactive mode
-        local selected_schemas
-        selected_schemas=$(prompt_select_multiple "Select schema(s) to delete:" $schemas)
+        # Use multiselect for interactive mode (add Back option)
+        selected_schemas=$(prompt_select_multiple "Select schema(s) to delete (or press Esc to go back):" $schemas)
         
         if [[ -z "$selected_schemas" ]]; then
-            log_error "No schemas selected"
-            return 1
-        fi
-        
-        # Build confirmation message
-        log_warning "This will permanently delete from database '$dbname':"
-        echo ""
-        
-        while IFS= read -r schema; do
-            [[ -z "$schema" ]] && continue
-            
-            if ! schema_exists "$dbname" "$schema"; then
-                continue
-            fi
-            
-            local prefix="${dbname}_${schema}"
-            local users=("${prefix}_owner" "${prefix}_migration_user" "${prefix}_fullaccess_user" "${prefix}_app_user" "${prefix}_readonly_user")
-            
-            echo "  Schema: $schema (with CASCADE)"
-            echo "  Users:"
-            for user in "${users[@]}"; do
-                if user_exists "$user"; then
-                    echo "    - $user"
-                fi
-            done
-            echo ""
-        done <<< "$selected_schemas"
-        
-        # Confirm deletion
-        if ! prompt_confirm "Are you sure you want to delete these schema(s)?"; then
-            log_info "Deletion cancelled"
             return 0
         fi
+    fi
+    
+    # Count selected schemas for message
+    local schema_count=0
+    while IFS= read -r s; do
+        [[ -n "$s" ]] && ((schema_count++))
+    done <<< "$selected_schemas"
+    
+    # Build confirmation message
+    log_warning "This will permanently delete from database '$dbname':"
+    echo ""
+    
+    while IFS= read -r schema; do
+        [[ -z "$schema" ]] && continue
         
-        # Delete each selected schema
-        while IFS= read -r schema; do
-            [[ -z "$schema" ]] && continue
-            
-            if ! schema_exists "$dbname" "$schema"; then
-                log_warning "Schema '$schema' does not exist in '$dbname', skipping"
-                continue
-            fi
-            
-            echo ""
-            log_info "Deleting schema: $schema"
-            _delete_one_schema "$dbname" "$schema"
-        done <<< "$selected_schemas"
-        
-        echo ""
-        log_success "Selected schemas and associated users deleted successfully"
-        
-    else
-        # Single schema mode (CLI argument provided)
-        # Verify schema exists
-        if ! schema_exists "$dbname" "$schemaname"; then
-            log_error "Schema '$schemaname' does not exist in database '$dbname'"
-            return 1
+        if ! schema_exists "$dbname" "$schema"; then
+            continue
         fi
         
-        # Define user prefix
-        local prefix="${dbname}_${schemaname}"
-        
-        # List users that will be deleted
+        local prefix="${dbname}_${schema}"
         local users=("${prefix}_owner" "${prefix}_migration_user" "${prefix}_fullaccess_user" "${prefix}_app_user" "${prefix}_readonly_user")
         
-        log_warning "This will permanently delete:"
-        echo "  Schema: $schemaname (with CASCADE)"
+        echo "  Schema: $schema (with CASCADE)"
         echo "  Users:"
         for user in "${users[@]}"; do
             if user_exists "$user"; then
@@ -555,16 +527,37 @@ delete_schema() {
             fi
         done
         echo ""
+    done <<< "$selected_schemas"
+    
+    # Confirm deletion (use plural message if multiple)
+    local confirm_msg="Are you sure you want to delete this schema?"
+    if [[ $schema_count -gt 1 ]]; then
+        confirm_msg="Are you sure you want to delete these $schema_count schemas?"
+    fi
+    
+    if ! prompt_confirm "$confirm_msg"; then
+        log_info "Deletion cancelled"
+        return 0
+    fi
+    
+    # Delete each selected schema
+    while IFS= read -r schema; do
+        [[ -z "$schema" ]] && continue
         
-        # Confirm deletion
-        if ! prompt_confirm "Are you sure you want to delete this schema?"; then
-            log_info "Deletion cancelled"
-            return 0
+        if ! schema_exists "$dbname" "$schema"; then
+            log_warning "Schema '$schema' does not exist in '$dbname', skipping"
+            continue
         fi
         
-        _delete_one_schema "$dbname" "$schemaname"
-        
         echo ""
+        log_info "Deleting schema: $schema"
+        _delete_one_schema "$dbname" "$schema"
+    done <<< "$selected_schemas"
+    
+    echo ""
+    if [[ $schema_count -gt 1 ]]; then
+        log_success "Selected schemas and associated users deleted successfully"
+    else
         log_success "Schema and all associated users deleted successfully"
     fi
 }
@@ -686,11 +679,10 @@ list_schema_users() {
             return 1
         fi
         
-        dbname=$(prompt_select "Select database:" $databases)
+        dbname=$(prompt_select "Select database:" $databases "Back")
         
-        if [[ -z "$dbname" ]]; then
-            log_error "No database selected"
-            return 1
+        if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -704,11 +696,10 @@ list_schema_users() {
             return 1
         fi
         
-        schemaname=$(prompt_select "Select schema:" $schemas)
+        schemaname=$(prompt_select "Select schema:" $schemas "Back")
         
-        if [[ -z "$schemaname" ]]; then
-            log_error "No schema selected"
-            return 1
+        if [[ -z "$schemaname" || "$schemaname" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -763,11 +754,10 @@ grant_schema_access() {
     fi
     
     local dbname
-    dbname=$(prompt_select "Select database:" $databases)
+    dbname=$(prompt_select "Select database:" $databases "Back")
     
-    if [[ -z "$dbname" ]]; then
-        log_error "No database selected"
-        return 1
+    if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+        return 0
     fi
     
     # Get schema
@@ -780,11 +770,10 @@ grant_schema_access() {
     fi
     
     local schemaname
-    schemaname=$(prompt_select "Select schema:" $schemas)
+    schemaname=$(prompt_select "Select schema:" $schemas "Back")
     
-    if [[ -z "$schemaname" ]]; then
-        log_error "No schema selected"
-        return 1
+    if [[ -z "$schemaname" || "$schemaname" == "Back" ]]; then
+        return 0
     fi
     
     # Get user(s) - use multiselect
@@ -797,20 +786,18 @@ grant_schema_access() {
     fi
     
     local selected_users
-    selected_users=$(prompt_select_multiple "Select user(s):" $users)
+    selected_users=$(prompt_select_multiple "Select user(s) (or press Esc to go back):" $users)
     
     if [[ -z "$selected_users" ]]; then
-        log_error "No users selected"
-        return 1
+        return 0
     fi
     
     # Select permission level (applies to all selected users)
     local role_type
-    role_type=$(prompt_select "Select permission level:" "readonly_user" "app_user" "fullaccess_user" "migration_user" "owner")
+    role_type=$(prompt_select "Select permission level:" "readonly_user" "app_user" "fullaccess_user" "migration_user" "owner" "Back")
     
-    if [[ -z "$role_type" ]]; then
-        log_error "No permission level selected"
-        return 1
+    if [[ -z "$role_type" || "$role_type" == "Back" ]]; then
+        return 0
     fi
     
     # Grant permissions to each selected user
@@ -856,11 +843,10 @@ add_schema_users() {
             return 1
         fi
         
-        dbname=$(prompt_select "Select database:" $databases)
+        dbname=$(prompt_select "Select database:" $databases "Back")
         
-        if [[ -z "$dbname" ]]; then
-            log_error "No database selected"
-            return 1
+        if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -882,11 +868,10 @@ add_schema_users() {
         
         # Use multiselect for interactive mode
         local selected_schemas
-        selected_schemas=$(prompt_select_multiple "Select schema(s):" $schemas)
+        selected_schemas=$(prompt_select_multiple "Select schema(s) (or press Esc to go back):" $schemas)
         
         if [[ -z "$selected_schemas" ]]; then
-            log_error "No schemas selected"
-            return 1
+            return 0
         fi
         
         # Collect credentials for all schemas
@@ -1290,6 +1275,122 @@ cmd_add_schema_users() {
 }
 
 # =============================================================================
+# Schema Details
+# =============================================================================
+
+# Get detailed information about a schema
+get_schema_details() {
+    local dbname="$1"
+    local schemaname="$2"
+    
+    if [[ -z "$dbname" || -z "$schemaname" ]]; then
+        log_error "Database name and schema name required"
+        return 1
+    fi
+    
+    if ! schema_exists "$dbname" "$schemaname"; then
+        log_error "Schema '$schemaname' does not exist in database '$dbname'"
+        return 1
+    fi
+    
+    log_info "Schema: $schemaname (in $dbname)"
+    echo ""
+    
+    local sql="SELECT 
+        n.nspname AS \"Schema\",
+        pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\",
+        (SELECT COUNT(*) FROM information_schema.tables t WHERE t.table_schema = n.nspname) AS \"Tables\",
+        (SELECT COUNT(*) FROM information_schema.views v WHERE v.table_schema = n.nspname) AS \"Views\",
+        (SELECT COUNT(*) FROM information_schema.routines r WHERE r.routine_schema = n.nspname) AS \"Functions\"
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname = '$schemaname';"
+    
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        local result
+        result=$(psql_admin "$sql" "$dbname" 2>/dev/null)
+        echo "$result" | gum table
+    else
+        psql_admin "$sql" "$dbname"
+    fi
+    echo ""
+}
+
+# =============================================================================
+# List Schemas Menu (Interactive RUD)
+# =============================================================================
+
+# Interactive list schemas with View/Delete actions
+cmd_list_schemas_menu() {
+    log_header "List Schemas"
+    
+    # Check connection
+    if ! check_connection; then
+        return 1
+    fi
+    
+    # First select a database
+    local databases
+    databases=$(list_with_loading "databases" "list_databases_query")
+    
+    if [[ -z "$databases" ]]; then
+        log_error "No databases found"
+        return 1
+    fi
+    
+    local dbname
+    dbname=$(prompt_select "Select database:" $databases "Back")
+    
+    if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+        return 0
+    fi
+    
+    # Show the schemas list
+    list_schemas "$dbname"
+    
+    echo ""
+    
+    # Get schema names for selection
+    local schema_names
+    schema_names=$(list_schemas_query "$dbname")
+    
+    if [[ -z "$schema_names" ]]; then
+        log_info "No schemas to manage in '$dbname'"
+        return 0
+    fi
+    
+    # Use shared RUD prompts helper
+    _list_rud_prompts "$schema_names" "Select schema(s) for action:" "View details" "Delete" "Back"
+    local rud_result=$?
+    
+    # Return code: 0 = action selected, 1 = empty, 2 = Back
+    if [[ $rud_result -ne 0 ]]; then
+        return 0
+    fi
+    
+    # Dispatch based on action
+    case "$RUD_ACTION" in
+        "View details")
+            while IFS= read -r schema; do
+                [[ -z "$schema" ]] && continue
+                echo ""
+                get_schema_details "$dbname" "$schema"
+            done <<< "$RUD_SELECTED"
+            ;;
+        "Delete")
+            # Convert newline-separated to args (db first, then schemas)
+            local -a schemas=()
+            while IFS= read -r schema; do
+                [[ -n "$schema" ]] && schemas+=("$schema")
+            done <<< "$RUD_SELECTED"
+            
+            if [[ ${#schemas[@]} -gt 0 ]]; then
+                delete_schema "$dbname" "${schemas[@]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
 # Register Commands
 # =============================================================================
 
@@ -1299,7 +1400,7 @@ register_command "Create Schema" "SCHEMA MANAGEMENT" "cmd_create_schema" \
 register_command "Delete Schema" "SCHEMA MANAGEMENT" "cmd_delete_schema" \
     "Delete a schema and all associated users"
 
-register_command "List Schemas" "SCHEMA MANAGEMENT" "cmd_list_schemas" \
+register_command "List Schemas" "SCHEMA MANAGEMENT" "cmd_list_schemas_menu" \
     "List all schemas in a database"
 
 register_command "Grant Schema Access" "SCHEMA MANAGEMENT" "cmd_grant_schema_access" \

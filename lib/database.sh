@@ -261,10 +261,8 @@ _delete_one_database() {
     done
 }
 
-# Delete a database and its users (supports multiselect)
+# Delete a database and its users (supports multiselect and preselected list)
 delete_database() {
-    local dbname="${1:-}"
-    
     log_header "Delete Database"
     
     # Check connection
@@ -272,8 +270,14 @@ delete_database() {
         return 1
     fi
     
-    # Get database name(s) if not provided
-    if [[ -z "$dbname" ]]; then
+    local selected_dbs=""
+    
+    # Determine mode: preselected list via args, or interactive multiselect
+    if [[ $# -ge 1 && -n "$1" ]]; then
+        # Preselected list mode: use all arguments as database names
+        selected_dbs=$(printf '%s\n' "$@")
+    else
+        # Interactive multiselect mode
         local databases
         databases=$(list_with_loading "databases" "list_databases_query")
         
@@ -283,89 +287,71 @@ delete_database() {
         fi
         
         # Use multiselect for interactive mode
-        local selected_dbs
         selected_dbs=$(prompt_select_multiple "Select database(s) to delete:" $databases)
         
         if [[ -z "$selected_dbs" ]]; then
             log_error "No databases selected"
             return 1
         fi
+    fi
+    
+    # Count selected databases for message
+    local db_count=0
+    while IFS= read -r db; do
+        [[ -n "$db" ]] && ((db_count++))
+    done <<< "$selected_dbs"
+    
+    # Build confirmation message
+    log_warning "This will permanently delete:"
+    echo ""
+    
+    while IFS= read -r db; do
+        [[ -z "$db" ]] && continue
         
-        # Build confirmation message
-        log_warning "This will permanently delete:"
-        echo ""
-        
-        while IFS= read -r db; do
-            [[ -z "$db" ]] && continue
-            
-            if ! database_exists "$db"; then
-                continue
-            fi
-            
-            echo "  Database: $db"
-            echo "  Users:"
-            local users=("${db}_owner" "${db}_migration_user" "${db}_fullaccess_user" "${db}_app_user" "${db}_readonly_user")
-            for user in "${users[@]}"; do
-                if user_exists "$user"; then
-                    echo "    - $user"
-                fi
-            done
-            echo ""
-        done <<< "$selected_dbs"
-        
-        # Confirm deletion
-        if ! prompt_confirm "Are you sure you want to delete these database(s)?"; then
-            log_info "Deletion cancelled"
-            return 0
+        if ! database_exists "$db"; then
+            continue
         fi
         
-        # Delete each selected database
-        while IFS= read -r db; do
-            [[ -z "$db" ]] && continue
-            
-            if ! database_exists "$db"; then
-                log_warning "Database '$db' does not exist, skipping"
-                continue
-            fi
-            
-            echo ""
-            log_info "Deleting database: $db"
-            _delete_one_database "$db"
-        done <<< "$selected_dbs"
-        
-        echo ""
-        log_success "Selected databases and associated users deleted successfully"
-        
-    else
-        # Single database mode (CLI argument provided)
-        # Check if database exists
-        if ! database_exists "$dbname"; then
-            log_error "Database '$dbname' does not exist"
-            return 1
-        fi
-        
-        # List users that will be deleted
-        local users=("${dbname}_owner" "${dbname}_migration_user" "${dbname}_fullaccess_user" "${dbname}_app_user" "${dbname}_readonly_user")
-        
-        log_warning "This will permanently delete:"
-        echo "  Database: $dbname"
+        echo "  Database: $db"
         echo "  Users:"
+        local users=("${db}_owner" "${db}_migration_user" "${db}_fullaccess_user" "${db}_app_user" "${db}_readonly_user")
         for user in "${users[@]}"; do
             if user_exists "$user"; then
                 echo "    - $user"
             fi
         done
         echo ""
+    done <<< "$selected_dbs"
+    
+    # Confirm deletion (use plural message if multiple)
+    local confirm_msg="Are you sure you want to delete this database?"
+    if [[ $db_count -gt 1 ]]; then
+        confirm_msg="Are you sure you want to delete these $db_count databases?"
+    fi
+    
+    if ! prompt_confirm "$confirm_msg"; then
+        log_info "Deletion cancelled"
+        return 0
+    fi
+    
+    # Delete each selected database
+    while IFS= read -r db; do
+        [[ -z "$db" ]] && continue
         
-        # Confirm deletion
-        if ! prompt_confirm "Are you sure you want to delete this database?"; then
-            log_info "Deletion cancelled"
-            return 0
+        if ! database_exists "$db"; then
+            log_warning "Database '$db' does not exist, skipping"
+            continue
         fi
         
-        _delete_one_database "$dbname"
-        
         echo ""
+        log_info "Deleting database: $db"
+        _delete_one_database "$db"
+    done <<< "$selected_dbs"
+    
+    echo ""
+    if [[ $db_count -gt 1 ]]; then
+        log_success "Selected databases and associated users deleted successfully"
+    else
         log_success "Database and all associated users deleted successfully"
     fi
 }
@@ -417,6 +403,105 @@ cmd_list_databases() {
 }
 
 # =============================================================================
+# Database Details
+# =============================================================================
+
+# Get detailed information about a database
+get_database_details() {
+    local dbname="$1"
+    
+    if [[ -z "$dbname" ]]; then
+        log_error "Database name required"
+        return 1
+    fi
+    
+    if ! database_exists "$dbname"; then
+        log_error "Database '$dbname' does not exist"
+        return 1
+    fi
+    
+    log_info "Database: $dbname"
+    echo ""
+    
+    local sql="SELECT 
+        d.datname AS \"Database\",
+        pg_catalog.pg_get_userbyid(d.datdba) AS \"Owner\",
+        pg_catalog.pg_encoding_to_char(d.encoding) AS \"Encoding\",
+        pg_size_pretty(pg_database_size(d.datname)) AS \"Size\",
+        (SELECT COUNT(*) FROM pg_stat_activity WHERE datname = d.datname) AS \"Connections\"
+    FROM pg_catalog.pg_database d
+    WHERE d.datname = '$dbname';"
+    
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        local result
+        result=$(psql_admin "$sql" 2>/dev/null)
+        echo "$result" | gum table
+    else
+        psql_admin "$sql"
+    fi
+    echo ""
+}
+
+# =============================================================================
+# List Databases Menu (Interactive RUD)
+# =============================================================================
+
+# Interactive list databases with View/Delete actions
+cmd_list_databases_menu() {
+    log_header "List Databases"
+    
+    # Check connection
+    if ! check_connection; then
+        return 1
+    fi
+    
+    # Show the list first
+    list_databases
+    
+    echo ""
+    
+    # Get database names for selection
+    local db_names
+    db_names=$(list_databases_query)
+    
+    if [[ -z "$db_names" ]]; then
+        log_info "No databases to manage"
+        return 0
+    fi
+    
+    # Use shared RUD prompts helper
+    _list_rud_prompts "$db_names" "Select database(s) for action:" "View details" "Delete" "Back"
+    local rud_result=$?
+    
+    # Return code: 0 = action selected, 1 = empty, 2 = Back
+    if [[ $rud_result -ne 0 ]]; then
+        return 0
+    fi
+    
+    # Dispatch based on action
+    case "$RUD_ACTION" in
+        "View details")
+            while IFS= read -r db; do
+                [[ -z "$db" ]] && continue
+                echo ""
+                get_database_details "$db"
+            done <<< "$RUD_SELECTED"
+            ;;
+        "Delete")
+            # Convert newline-separated to args
+            local -a dbs=()
+            while IFS= read -r db; do
+                [[ -n "$db" ]] && dbs+=("$db")
+            done <<< "$RUD_SELECTED"
+            
+            if [[ ${#dbs[@]} -gt 0 ]]; then
+                delete_database "${dbs[@]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
 # Register Commands
 # =============================================================================
 
@@ -426,5 +511,5 @@ register_command "Create Database" "DATABASE MANAGEMENT" "cmd_create_db" \
 register_command "Delete Database" "DATABASE MANAGEMENT" "cmd_delete_db" \
     "Delete a database and all associated users"
 
-register_command "List Databases" "DATABASE MANAGEMENT" "cmd_list_databases" \
+register_command "List Databases" "DATABASE MANAGEMENT" "cmd_list_databases_menu" \
     "List all available databases"

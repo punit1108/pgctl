@@ -49,13 +49,12 @@ create_user_wizard() {
     fi
     
     # Select role type
-    local role_types=("readonly_user" "app_user" "fullaccess_user" "migration_user" "owner" "custom")
+    local role_types=("readonly_user" "app_user" "fullaccess_user" "migration_user" "owner" "custom" "Back")
     local role_type
     role_type=$(prompt_select "Select role type:" "${role_types[@]}")
     
-    if [[ -z "$role_type" ]]; then
-        log_error "No role type selected"
-        return 1
+    if [[ -z "$role_type" || "$role_type" == "Back" ]]; then
+        return 0
     fi
     
     # Handle custom permissions
@@ -245,11 +244,10 @@ view_user_permissions() {
             return 1
         fi
         
-        username=$(prompt_select "Select user:" $users)
+        username=$(prompt_select "Select user:" $users "Back")
         
-        if [[ -z "$username" ]]; then
-            log_error "No user selected"
-            return 1
+        if [[ -z "$username" || "$username" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -263,11 +261,10 @@ view_user_permissions() {
             return 1
         fi
         
-        dbname=$(prompt_select "Select database:" $databases)
+        dbname=$(prompt_select "Select database:" $databases "Back")
         
-        if [[ -z "$dbname" ]]; then
-            log_error "No database selected"
-            return 1
+        if [[ -z "$dbname" || "$dbname" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -482,11 +479,10 @@ change_user_password() {
             return 1
         fi
         
-        username=$(prompt_select "Select user:" $users)
+        username=$(prompt_select "Select user:" $users "Back")
         
-        if [[ -z "$username" ]]; then
-            log_error "No user selected"
-            return 1
+        if [[ -z "$username" || "$username" == "Back" ]]; then
+            return 0
         fi
     fi
     
@@ -600,10 +596,8 @@ _clean_user_from_all_databases() {
     fi
 }
 
-# Delete user (supports multiselect)
+# Delete user (supports multiselect and preselected list)
 delete_user() {
-    local username="${1:-}"
-    
     log_header "Delete User"
     
     # Check connection
@@ -611,8 +605,14 @@ delete_user() {
         return 1
     fi
     
-    # Get username(s) if not provided
-    if [[ -z "$username" ]]; then
+    local selected_users=""
+    
+    # Determine mode: preselected list via args, or interactive multiselect
+    if [[ $# -ge 1 && -n "$1" ]]; then
+        # Preselected list mode: use all arguments as usernames
+        selected_users=$(printf '%s\n' "$@")
+    else
+        # Interactive multiselect mode
         local users
         users=$(list_with_loading "users" "list_users_query")
         
@@ -622,151 +622,92 @@ delete_user() {
         fi
         
         # Use multiselect for interactive mode
-        local selected_users
         selected_users=$(prompt_select_multiple "Select user(s) to delete:" $users)
         
         if [[ -z "$selected_users" ]]; then
             log_error "No users selected"
             return 1
         fi
+    fi
+    
+    # Count selected users for message
+    local user_count=0
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && ((user_count++))
+    done <<< "$selected_users"
+    
+    # Check which users own objects
+    local -a users_need_reassign=()
+    local -a users_clean=()
+    
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
         
-        # Check which users own objects
-        local -a users_need_reassign=()
-        local -a users_clean=()
-        
-        while IFS= read -r user; do
-            [[ -z "$user" ]] && continue
-            
-            if ! user_exists "$user"; then
-                continue
-            fi
-            
-            local owned_objects
-            owned_objects=$(psql_admin "SELECT COUNT(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user');" 2>/dev/null | tail -n +3 | head -n 1 | tr -d ' ')
-            
-            if [[ "${owned_objects:-0}" -gt 0 ]]; then
-                users_need_reassign+=("$user (owns $owned_objects objects)")
-            else
-                users_clean+=("$user")
-            fi
-        done <<< "$selected_users"
-        
-        # Build confirmation message
-        log_warning "This will permanently delete:"
-        echo ""
-        
-        if [[ ${#users_need_reassign[@]} -gt 0 ]]; then
-            echo "  Users with owned objects (will be reassigned to $PGADMIN):"
-            for user_info in "${users_need_reassign[@]}"; do
-                echo "    - $user_info"
-            done
-            echo ""
+        if ! user_exists "$user"; then
+            continue
         fi
         
-        if [[ ${#users_clean[@]} -gt 0 ]]; then
-            echo "  Users without owned objects:"
-            for user in "${users_clean[@]}"; do
-                echo "    - $user"
-            done
-            echo ""
-        fi
-        
-        # Confirm deletion
-        if ! prompt_confirm "Are you sure you want to delete these user(s)?"; then
-            log_info "Deletion cancelled"
-            return 0
-        fi
-        
-        # Delete each selected user
-        local deletion_errors=0
-        while IFS= read -r user; do
-            [[ -z "$user" ]] && continue
-            
-            if ! user_exists "$user"; then
-                log_warning "User '$user' does not exist, skipping"
-                continue
-            fi
-            
-            echo ""
-            log_info "Deleting user: $user"
-            
-            # Clean privileges from all databases
-            if [[ "$GUM_AVAILABLE" == "true" ]]; then
-                gum spin --spinner dot --title "Cleaning privileges from all databases..." -- \
-                    bash -c "source '${PGCTL_LIB_DIR}/users.sh' && _clean_user_from_all_databases '$user'"
-            else
-                echo -n "Cleaning privileges from all databases... "
-                _clean_user_from_all_databases "$user"
-                echo "done"
-            fi
-            
-            # Now drop the user role
-            local drop_output
-            local drop_result
-            
-            if [[ "$GUM_AVAILABLE" == "true" ]]; then
-                drop_output=$(gum spin --spinner dot --title "Deleting user $user..." -- \
-                    bash -c "source '${PGCTL_LIB_DIR}/common.sh'; psql_admin \"DROP ROLE $user;\"")
-                drop_result=$?
-            else
-                echo -n "Deleting user $user... "
-                drop_output=$(psql_admin "DROP ROLE $user;")
-                drop_result=$?
-            fi
-            
-            if [[ $drop_result -eq 0 ]]; then
-                log_success "User '$user' deleted"
-            else
-                log_error "Failed to delete user '$user'"
-                # Show the actual error message
-                if [[ -n "$drop_output" ]]; then
-                    echo "  Error details: $drop_output" | grep -i "error" || echo "  $drop_output"
-                fi
-                ((deletion_errors++))
-            fi
-        done <<< "$selected_users"
-        
-        echo ""
-        if [[ $deletion_errors -eq 0 ]]; then
-            log_success "All selected users deleted successfully"
-        else
-            log_warning "Completed with $deletion_errors error(s)"
-            return 1
-        fi
-        
-    else
-        # Single user mode (CLI argument provided)
-        # Verify user exists
-        if ! user_exists "$username"; then
-            log_error "User '$username' does not exist"
-            return 1
-        fi
-        
-        # Check for owned objects
         local owned_objects
-        owned_objects=$(psql_admin "SELECT COUNT(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$username');" 2>/dev/null | tail -n +3 | head -n 1 | tr -d ' ')
+        owned_objects=$(psql_admin "SELECT COUNT(*) FROM pg_class WHERE relowner = (SELECT oid FROM pg_roles WHERE rolname = '$user');" 2>/dev/null | tail -n +3 | head -n 1 | tr -d ' ')
         
         if [[ "${owned_objects:-0}" -gt 0 ]]; then
-            log_warning "User '$username' owns $owned_objects objects"
-            log_warning "These objects will be reassigned to $PGADMIN before deletion"
+            users_need_reassign+=("$user (owns $owned_objects objects)")
+        else
+            users_clean+=("$user")
         fi
+    done <<< "$selected_users"
+    
+    # Build confirmation message
+    log_warning "This will permanently delete:"
+    echo ""
+    
+    if [[ ${#users_need_reassign[@]} -gt 0 ]]; then
+        echo "  Users with owned objects (will be reassigned to $PGADMIN):"
+        for user_info in "${users_need_reassign[@]}"; do
+            echo "    - $user_info"
+        done
+        echo ""
+    fi
+    
+    if [[ ${#users_clean[@]} -gt 0 ]]; then
+        echo "  Users without owned objects:"
+        for user in "${users_clean[@]}"; do
+            echo "    - $user"
+        done
+        echo ""
+    fi
+    
+    # Confirm deletion (use plural message if multiple)
+    local confirm_msg="Are you sure you want to delete this user?"
+    if [[ $user_count -gt 1 ]]; then
+        confirm_msg="Are you sure you want to delete these $user_count users?"
+    fi
+    
+    if ! prompt_confirm "$confirm_msg"; then
+        log_info "Deletion cancelled"
+        return 0
+    fi
+    
+    # Delete each selected user
+    local deletion_errors=0
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
         
-        log_warning "This will permanently delete user '$username' and revoke all privileges across all databases"
-        
-        if ! prompt_confirm "Are you sure you want to delete this user?"; then
-            log_info "Deletion cancelled"
-            return 0
+        if ! user_exists "$user"; then
+            log_warning "User '$user' does not exist, skipping"
+            continue
         fi
         
         echo ""
+        log_info "Deleting user: $user"
         
         # Clean privileges from all databases
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
             gum spin --spinner dot --title "Cleaning privileges from all databases..." -- \
-                bash -c "source '${PGCTL_LIB_DIR}/users.sh' && _clean_user_from_all_databases '$username'"
+                bash -c "source '${PGCTL_LIB_DIR}/users.sh' && _clean_user_from_all_databases '$user'"
         else
             echo -n "Cleaning privileges from all databases... "
-            _clean_user_from_all_databases "$username"
+            _clean_user_from_all_databases "$user"
             echo "done"
         fi
         
@@ -775,27 +716,37 @@ delete_user() {
         local drop_result
         
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
-            drop_output=$(gum spin --spinner dot --title "Deleting user $username..." -- \
-                bash -c "source '${PGCTL_LIB_DIR}/common.sh'; psql_admin \"DROP ROLE $username;\"")
+            drop_output=$(gum spin --spinner dot --title "Deleting user $user..." -- \
+                bash -c "source '${PGCTL_LIB_DIR}/common.sh'; psql_admin \"DROP ROLE $user;\"")
             drop_result=$?
         else
-            echo -n "Deleting user $username... "
-            drop_output=$(psql_admin "DROP ROLE $username;")
+            echo -n "Deleting user $user... "
+            drop_output=$(psql_admin "DROP ROLE $user;")
             drop_result=$?
         fi
         
         if [[ $drop_result -eq 0 ]]; then
-            echo ""
-            log_success "User '$username' deleted successfully"
+            log_success "User '$user' deleted"
         else
-            echo ""
-            log_error "Failed to delete user '$username'"
+            log_error "Failed to delete user '$user'"
             # Show the actual error message
             if [[ -n "$drop_output" ]]; then
                 echo "  Error details: $drop_output" | grep -i "error" || echo "  $drop_output"
             fi
-            return 1
+            ((deletion_errors++))
         fi
+    done <<< "$selected_users"
+    
+    echo ""
+    if [[ $deletion_errors -eq 0 ]]; then
+        if [[ $user_count -gt 1 ]]; then
+            log_success "All selected users deleted successfully"
+        else
+            log_success "User deleted successfully"
+        fi
+    else
+        log_warning "Completed with $deletion_errors error(s)"
+        return 1
     fi
 }
 
@@ -885,6 +836,74 @@ cmd_view_user() {
 }
 
 # =============================================================================
+# List Users Menu (Interactive RUD)
+# =============================================================================
+
+# Interactive list users with View/Change password/Delete actions
+cmd_list_users_menu() {
+    log_header "List Users"
+    
+    # Check connection
+    if ! check_connection; then
+        return 1
+    fi
+    
+    # Show the users list
+    list_users
+    
+    echo ""
+    
+    # Get user names for selection
+    local user_names
+    user_names=$(list_users_query)
+    
+    if [[ -z "$user_names" ]]; then
+        log_info "No users to manage"
+        return 0
+    fi
+    
+    # Use shared RUD prompts helper
+    _list_rud_prompts "$user_names" "Select user(s) for action:" "View / manage permissions" "Change password" "Delete" "Back"
+    local rud_result=$?
+    
+    # Return code: 0 = action selected, 1 = empty, 2 = Back
+    if [[ $rud_result -ne 0 ]]; then
+        return 0
+    fi
+    
+    # Dispatch based on action
+    case "$RUD_ACTION" in
+        "View / manage permissions")
+            # View permissions works on one user at a time
+            local first_user
+            first_user=$(echo "$RUD_SELECTED" | head -n 1)
+            if [[ -n "$first_user" ]]; then
+                view_user_permissions "$first_user"
+            fi
+            ;;
+        "Change password")
+            # Change password works on one user at a time
+            local first_user
+            first_user=$(echo "$RUD_SELECTED" | head -n 1)
+            if [[ -n "$first_user" ]]; then
+                change_user_password "$first_user"
+            fi
+            ;;
+        "Delete")
+            # Convert newline-separated to args
+            local -a users=()
+            while IFS= read -r user; do
+                [[ -n "$user" ]] && users+=("$user")
+            done <<< "$RUD_SELECTED"
+            
+            if [[ ${#users[@]} -gt 0 ]]; then
+                delete_user "${users[@]}"
+            fi
+            ;;
+    esac
+}
+
+# =============================================================================
 # Register Commands
 # =============================================================================
 
@@ -897,7 +916,7 @@ register_command "Change Password" "USER MANAGEMENT" "cmd_change_password" \
 register_command "Delete User" "USER MANAGEMENT" "cmd_delete_user" \
     "Delete a user"
 
-register_command "List Users" "USER MANAGEMENT" "cmd_list_users" \
+register_command "List Users" "USER MANAGEMENT" "cmd_list_users_menu" \
     "List all database users"
 
 register_command "View User Permissions" "USER MANAGEMENT" "cmd_view_user" \

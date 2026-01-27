@@ -151,12 +151,18 @@ prompt_input() {
     local prompt="$1"
     local default="${2:-}"
     local result
+    local gum_exit_code
     
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         if [[ -n "$default" ]]; then
-            result=$(gum input --placeholder "$prompt" --value "$default")
+            result=$(gum input --placeholder "$prompt" --value "$default") && gum_exit_code=0 || gum_exit_code=$?
         else
-            result=$(gum input --placeholder "$prompt")
+            result=$(gum input --placeholder "$prompt") && gum_exit_code=0 || gum_exit_code=$?
+        fi
+        # Exit on Ctrl+C
+        if [[ $gum_exit_code -eq 130 ]]; then
+            echo ""
+            exit 130
         fi
     else
         if [[ -n "$default" ]]; then
@@ -173,9 +179,15 @@ prompt_input() {
 prompt_password() {
     local prompt="$1"
     local result
+    local gum_exit_code
     
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        result=$(gum input --password --placeholder "$prompt")
+        result=$(gum input --password --placeholder "$prompt") && gum_exit_code=0 || gum_exit_code=$?
+        # Exit on Ctrl+C
+        if [[ $gum_exit_code -eq 130 ]]; then
+            echo ""
+            exit 130
+        fi
     else
         read -rsp "$prompt: " result
         echo "" >&2  # New line after password input
@@ -187,13 +199,17 @@ prompt_password() {
 prompt_confirm() {
     local prompt="$1"
     local default="${2:-n}"  # Default to 'n' (no)
+    local gum_exit_code
     
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        if gum confirm "$prompt"; then
-            return 0
-        else
-            return 1
+        gum confirm "$prompt" && gum_exit_code=0 || gum_exit_code=$?
+        # Exit on Ctrl+C (exit code 130 = 128 + SIGINT)
+        if [[ $gum_exit_code -eq 130 ]]; then
+            echo ""
+            exit 130
         fi
+        # Return based on gum's exit code (0 = yes, 1 = no)
+        return $gum_exit_code
     else
         local yn_prompt
         if [[ "$default" == "y" ]]; then
@@ -225,9 +241,16 @@ prompt_select() {
     shift
     local options=("$@")
     local result
+    local gum_exit_code
     
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        result=$(printf '%s\n' "${options[@]}" | gum choose --header "$prompt")
+        # Output options to gum, capture exit code for Ctrl+C handling
+        result=$(printf '%s\n' "${options[@]}" | gum choose --header "$prompt") && gum_exit_code=0 || gum_exit_code=$?
+        # Exit on Ctrl+C (exit code 130 = 128 + SIGINT)
+        if [[ $gum_exit_code -eq 130 ]]; then
+            echo ""
+            exit 130
+        fi
     else
         echo "$prompt:"
         local i=1
@@ -254,9 +277,26 @@ prompt_select_multiple() {
     shift
     local options=("$@")
     local result
+    local gum_exit_code
     
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
-        result=$(printf '%s\n' "${options[@]}" | gum choose --no-limit --header "$prompt")
+        # Output options to gum, capture exit code for Ctrl+C handling
+        result=$(printf '%s\n' "${options[@]}" | gum choose --no-limit --header "$prompt") && gum_exit_code=0 || gum_exit_code=$?
+        # Exit on Ctrl+C (exit code 130 = 128 + SIGINT)
+        if [[ $gum_exit_code -eq 130 ]]; then
+            echo ""
+            exit 130
+        fi
+        
+        # If empty, remind and retry once
+        if [[ -z "$result" ]]; then
+            log_warning "Please select at least one option."
+            result=$(printf '%s\n' "${options[@]}" | gum choose --no-limit --header "$prompt") && gum_exit_code=0 || gum_exit_code=$?
+            if [[ $gum_exit_code -eq 130 ]]; then
+                echo ""
+                exit 130
+            fi
+        fi
     else
         echo "$prompt (enter numbers separated by spaces, or 'all'):"
         local i=1
@@ -278,9 +318,84 @@ prompt_select_multiple() {
                 fi
             done
         fi
+        
+        # If empty in non-GUM mode, remind and retry once
+        if [[ -z "$result" ]]; then
+            log_warning "Please select at least one option."
+            read -rp "Enter selections: " selection
+            
+            if [[ "$selection" == "all" ]]; then
+                result=$(printf '%s\n' "${options[@]}")
+            else
+                result=""
+                for sel in $selection; do
+                    if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#options[@]} )); then
+                        result+="${options[$((sel-1))]}"$'\n'
+                    fi
+                done
+            fi
+        fi
     fi
     
     echo "$result"
+}
+
+# =============================================================================
+# List RUD (Read/Update/Delete) Prompts Helper
+# =============================================================================
+
+# Global variables set by _list_rud_prompts
+RUD_SELECTED=""
+RUD_ACTION=""
+
+# Shared helper for list+action flows
+# Usage: _list_rud_prompts "names_newline" "select_prompt" action1 action2 ...
+# Sets RUD_SELECTED (newline-separated) and RUD_ACTION
+# Returns: 0 = action selected, 1 = empty selection, 2 = Back selected
+_list_rud_prompts() {
+    local names_newline="$1"
+    local select_prompt="$2"
+    shift 2
+    local actions=("$@")
+    
+    # Reset globals
+    RUD_SELECTED=""
+    RUD_ACTION=""
+    
+    # Convert newline-separated names to array
+    local names=()
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && names+=("$name")
+    done <<< "$names_newline"
+    
+    if [[ ${#names[@]} -eq 0 ]]; then
+        return 1
+    fi
+    
+    # Prompt for selection
+    local selected
+    selected=$(prompt_select_multiple "$select_prompt" "${names[@]}")
+    
+    if [[ -z "$selected" ]]; then
+        return 1
+    fi
+    
+    RUD_SELECTED="$selected"
+    
+    # Prompt for action
+    local action
+    action=$(prompt_select "Choose action:" "${actions[@]}")
+    
+    if [[ -z "$action" ]]; then
+        return 1
+    fi
+    
+    if [[ "$action" == "Back" ]]; then
+        return 2
+    fi
+    
+    RUD_ACTION="$action"
+    return 0
 }
 
 # =============================================================================

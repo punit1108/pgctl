@@ -42,87 +42,78 @@ get_commands_for_category() {
     done | sort
 }
 
-# Generate menu items array for gum choose
-generate_menu_array() {
-    local category
+# Check if a category has any registered commands
+category_has_commands() {
+    local target_category="$1"
+    local i
     
+    for i in "${!PGCTL_CMD_NAMES[@]}"; do
+        if [[ "${PGCTL_CMD_CATS[$i]}" == "$target_category" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Get list of categories that have commands
+get_active_categories() {
+    local category
     while IFS= read -r category; do
         [[ -z "$category" ]] && continue
-        
-        local has_items=false
-        local i
-        for i in "${!PGCTL_CMD_NAMES[@]}"; do
-            if [[ "${PGCTL_CMD_CATS[$i]}" == "$category" ]]; then
-                has_items=true
-                break
-            fi
-        done
-        
-        if [[ "$has_items" == "true" ]]; then
-            get_commands_for_category "$category"
+        if category_has_commands "$category"; then
+            echo "$category"
         fi
     done <<< "$MENU_CATEGORIES"
-    
-    echo "Exit"
 }
 
 # =============================================================================
 # Menu Display Functions
 # =============================================================================
 
-# Display the main interactive menu
-display_menu() {
+# Helper to generate command list for a category
+_generate_command_menu() {
+    local category="$1"
+    get_commands_for_category "$category"
+    echo "Back"
+}
+
+# Display a category sub-menu (one reusable function for all categories)
+display_category_menu() {
+    local category="$1"
+    
     while true; do
-        log_header "PostgreSQL Management (pgctl)"
-        
+        log_header "$category"
         echo ""
         
         local selection
+        local gum_exit_code
         
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
-            # Generate menu with category headers
-            selection=$(generate_menu_array | gum choose --header "Select an operation:")
+            selection=$(_generate_command_menu "$category" | gum choose --header "Select an operation:") && gum_exit_code=0 || gum_exit_code=$?
+            # Exit on Ctrl+C (exit code 130 = 128 + SIGINT)
+            if [[ $gum_exit_code -eq 130 ]]; then
+                echo ""
+                exit 130
+            fi
         else
-            # Fallback menu display
             echo "Select an operation:"
             echo ""
             
+            local commands=()
+            while IFS= read -r cmd; do
+                [[ -n "$cmd" ]] && commands+=("$cmd")
+            done < <(_generate_command_menu "$category")
+            
             local i=1
-            local category
-            local menu_items=()
-            
-            while IFS= read -r category; do
-                [[ -z "$category" ]] && continue
-                
-                local has_items=false
-                local idx
-                for idx in "${!PGCTL_CMD_NAMES[@]}"; do
-                    if [[ "${PGCTL_CMD_CATS[$idx]}" == "$category" ]]; then
-                        has_items=true
-                        break
-                    fi
-                done
-                
-                if [[ "$has_items" == "true" ]]; then
-                    echo -e "\n  ${BOLD}$category${NC}"
-                    while IFS= read -r cmd; do
-                        [[ -z "$cmd" ]] && continue
-                        echo "    $i) $cmd"
-                        menu_items+=("$cmd")
-                        ((i++))
-                    done < <(get_commands_for_category "$category")
-                fi
-            done <<< "$MENU_CATEGORIES"
-            
+            for cmd in "${commands[@]}"; do
+                echo "  $i) $cmd"
+                ((i++))
+            done
             echo ""
-            echo "    $i) Exit"
-            menu_items+=("Exit")
+            read -rp "Enter selection (1-${#commands[@]}): " sel_num
             
-            echo ""
-            read -rp "Enter selection (1-$i): " sel_num
-            
-            if [[ "$sel_num" =~ ^[0-9]+$ ]] && (( sel_num >= 1 && sel_num <= i )); then
-                selection="${menu_items[$((sel_num-1))]}"
+            if [[ "$sel_num" =~ ^[0-9]+$ ]] && (( sel_num >= 1 && sel_num <= ${#commands[@]} )); then
+                selection="${commands[$((sel_num-1))]}"
             else
                 selection=""
             fi
@@ -130,13 +121,13 @@ display_menu() {
         
         echo ""
         
-        # Handle selection
+        # Handle empty selection
         if [[ -z "$selection" ]]; then
             continue
         fi
         
-        if [[ "$selection" == "Exit" ]]; then
-            log_info "Goodbye!"
+        # Handle Back
+        if [[ "$selection" == "Back" ]]; then
             return 0
         fi
         
@@ -145,19 +136,91 @@ display_menu() {
         
         echo ""
         
-        # Wait for user to acknowledge before showing menu again
+        # After command execution, prompt to continue or go back
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
-            if gum confirm "Return to main menu?"; then
-                continue
-            else
+            local confirm_exit_code
+            gum confirm "Continue in $category?" && confirm_exit_code=0 || confirm_exit_code=$?
+            # Exit on Ctrl+C
+            if [[ $confirm_exit_code -eq 130 ]]; then
+                echo ""
+                exit 130
+            fi
+            # Return to parent menu if user said no
+            if [[ $confirm_exit_code -ne 0 ]]; then
                 return 0
             fi
         else
-            read -rp "Press Enter to return to main menu (or 'q' to quit): " response
-            if [[ "$response" == "q" ]]; then
+            read -rp "Press Enter to continue in $category (or 'b' to go back): " response
+            if [[ "$response" == "b" ]]; then
                 return 0
             fi
         fi
+        
+        clear 2>/dev/null || true
+    done
+}
+
+# Helper to generate category list for menu
+_generate_category_menu() {
+    get_active_categories
+    echo "Exit"
+}
+
+# Display the main interactive menu (category picker)
+display_menu() {
+    while true; do
+        log_header "PostgreSQL Management (pgctl)"
+        echo ""
+        
+        local selection
+        local gum_exit_code
+        
+        if [[ "$GUM_AVAILABLE" == "true" ]]; then
+            selection=$(_generate_category_menu | gum choose --header "Select a category:") && gum_exit_code=0 || gum_exit_code=$?
+            # Exit on Ctrl+C (exit code 130 = 128 + SIGINT)
+            if [[ $gum_exit_code -eq 130 ]]; then
+                echo ""
+                exit 130
+            fi
+        else
+            echo "Select a category:"
+            echo ""
+            
+            local categories=()
+            while IFS= read -r cat; do
+                [[ -n "$cat" ]] && categories+=("$cat")
+            done < <(_generate_category_menu)
+            
+            local i=1
+            for cat in "${categories[@]}"; do
+                echo "  $i) $cat"
+                ((i++))
+            done
+            echo ""
+            read -rp "Enter selection (1-${#categories[@]}): " sel_num
+            
+            if [[ "$sel_num" =~ ^[0-9]+$ ]] && (( sel_num >= 1 && sel_num <= ${#categories[@]} )); then
+                selection="${categories[$((sel_num-1))]}"
+            else
+                selection=""
+            fi
+        fi
+        
+        echo ""
+        
+        # Handle empty selection
+        if [[ -z "$selection" ]]; then
+            continue
+        fi
+        
+        # Handle Exit
+        if [[ "$selection" == "Exit" ]]; then
+            log_info "Goodbye!"
+            return 0
+        fi
+        
+        # Display the category sub-menu
+        display_category_menu "$selection"
         
         clear 2>/dev/null || true
     done
